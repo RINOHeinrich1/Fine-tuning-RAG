@@ -5,7 +5,7 @@ from sentence_transformers import SentenceTransformer, InputExample, losses
 from torch.utils.data import DataLoader
 import os
 # --- Config ---
-EMBEDDING_MODEL_NAME = 'models/esti-rag-ft'
+EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TOP_K = 3
 BATCH_SIZE = 4
