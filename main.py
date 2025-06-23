@@ -232,8 +232,8 @@ def feedback(request: FeedbackRequest):
         docs_before, scores_before = search_faiss(request.question)
 
         # 🏋️ Fine-tuning
-        updated_model = fine_tune_with_multiple_negatives(
-    request.question, request.positive_docs,
+        updated_model = fine_tune_until_margin_respected(
+    request.question, request.positive_docs,request.negative_docs,
     model, BATCH_SIZE, EPOCHS, WARMUP_STEPS, DEVICE
 )
 
