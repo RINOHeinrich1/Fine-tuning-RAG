@@ -1,19 +1,41 @@
+import os
 import faiss
-import numpy as np
 import torch
+import numpy as np
+from fastapi import FastAPI, HTTPException
 from sentence_transformers import SentenceTransformer, InputExample, losses
 from torch.utils.data import DataLoader
-import os
-# --- Config ---
-EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+from pydantic import BaseModel
+from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+# --- Configuration ---
+EMBEDDING_MODEL_NAME = "models/esti-rag-ft"
+
+if os.path.exists(EMBEDDING_MODEL_NAME):
+    print(f"📂 Chargement du modèle fine-tuné depuis {EMBEDDING_MODEL_NAME}")
+else:
+    print(f"🌐 Aucun modèle fine-tuné trouvé. Chargement du modèle de base : {EMBEDDING_MODEL_NAME}")
+    EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TOP_K = 3
 BATCH_SIZE = 4
 EPOCHS = 2
 WARMUP_STEPS = 10
 
-# --- 1. Chargement du modèle et des documents ---
-print("📦 Chargement du modèle...")
+# --- Initialisation ---
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Remplace "*" par ["http://localhost:5173"] ou ton domaine en production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=DEVICE)
 
 documents = [
@@ -27,7 +49,7 @@ documents = [
     "Le contact téléphonique de l'ESTI est 0330828086, 0340220452 ou 0320420452."
 ]
 
-# --- 2. Création de l'index FAISS ---
+# --- FAISS Index ---
 def build_faiss_index(embeddings):
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
@@ -37,34 +59,11 @@ def build_faiss_index(embeddings):
 doc_embeddings = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
 index = build_faiss_index(doc_embeddings)
 
-#--- 3. Sauvegarde de l'index FAISS ---
-def save_faiss_index(index, embeddings, dir_path="faiss_data", index_filename="esti.index", emb_filename="esti_embeddings.npy"):
-    """
-    Sauvegarde l'index FAISS et les embeddings dans un dossier donné.
-
-    Args:
-        index: L'objet FAISS (ex: IndexFlatIP)
-        embeddings: Les vecteurs de documents (numpy array)
-        dir_path: Dossier de destination (sera créé s'il n'existe pas)
-        index_filename: Nom du fichier index FAISS
-        emb_filename: Nom du fichier des embeddings .npy
-    """
-    os.makedirs(dir_path, exist_ok=True)
-
-    faiss.write_index(index, os.path.join(dir_path, index_filename))
-    np.save(os.path.join(dir_path, emb_filename), embeddings)
-
-    print(f"✅ Index FAISS sauvegardé dans {os.path.join(dir_path, index_filename)}")
-    print(f"✅ Embeddings sauvegardés dans {os.path.join(dir_path, emb_filename)}")
-    
-# --- 3. Recherche FAISS ---
-def search_faiss(question, k=TOP_K):
+def search_faiss(question: str, k=TOP_K):
     q_emb = model.encode([question], convert_to_numpy=True, normalize_embeddings=True)
     distances, indices = index.search(q_emb, k)
-    retrieved_docs = [documents[i] for i in indices[0]]
-    return retrieved_docs, distances[0]
+    return [documents[i] for i in indices[0]], distances[0].tolist()
 
-# --- 4. Fine-tuning ---
 def fine_tune_model(question, positive_docs, negative_docs):
     train_examples = []
     for doc in positive_docs:
@@ -98,80 +97,147 @@ def fine_tune_model(question, positive_docs, negative_docs):
 
     # 💾 Sauvegarde temporaire et rechargement du modèle pour rafraîchir les poids
     model.save("models/esti-rag-ft")
-
     return SentenceTransformer("models/esti-rag-ft", device=DEVICE)
 
-try:
-    import readline
-except ImportError:
-    pass  # Ignore if not available
+def evaluate_score_margin(model, question, positive_docs, negative_docs, device):
+    model.eval()
+    with torch.no_grad():
+        q_emb = model.encode(question, convert_to_tensor=True, device=device)
 
-try:
-    # --- 5. Boucle interactive ---
-    print("\n--- 🔁 RAG interactif avec feedback utilisateur ---")
-    print("Tape 'exit' pour quitter.\n")
+        pos_scores = []
+        for doc in positive_docs:
+            d_emb = model.encode(doc, convert_to_tensor=True, device=device)
+            pos_scores.append(torch.nn.functional.cosine_similarity(q_emb, d_emb, dim=0).item())
 
-    while True:
-        question = input("❓ Question : ")
-        if question.lower() in ['exit', 'quit']:
+        neg_scores = []
+        for doc in negative_docs:
+            d_emb = model.encode(doc, convert_to_tensor=True, device=device)
+            neg_scores.append(torch.nn.functional.cosine_similarity(q_emb, d_emb, dim=0).item())
+
+    min_pos = min(pos_scores)
+    max_neg = max(neg_scores)
+    return min_pos, max_neg, pos_scores, neg_scores
+
+def fine_tune_until_margin_respected(question, positive_docs, negative_docs,
+                                     model, batch_size, epochs, warmup_steps, device,
+                                     max_iterations=10):
+    iteration = 0
+    current_model = model
+
+    while iteration < max_iterations:
+        iteration += 1
+        print(f"\n🔄 Itération #{iteration} de fine-tuning...")
+
+        train_examples = [
+            InputExample(texts=[question, doc], label=1.0) for doc in positive_docs
+        ] + [
+            InputExample(texts=[question, doc], label=0.0) for doc in negative_docs
+        ]
+
+        if not train_examples:
+            print("⚠️ Aucun exemple pour fine-tuning.")
             break
 
-        retrieved_docs, scores = search_faiss(question)
-        print("\n📚 Documents récupérés :")
-        for i, (doc, score) in enumerate(zip(retrieved_docs, scores)):
-            print(f"[{i}] (score={score:.4f}) {doc}")
+        train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=batch_size)
+        train_loss = losses.CosineSimilarityLoss(current_model)
 
-        feedback = input("🧠 Indique les indices des docs pertinents (ex: 0 2), ou tape 'none' si aucun : ").strip().lower()
+        current_model.train()
+        current_model.fit(
+            train_objectives=[(train_dataloader, train_loss)],
+            epochs=epochs,
+            warmup_steps=warmup_steps,
+            show_progress_bar=True
+        )
+        print("✅ Fine-tuning terminé pour cette itération.")
 
-        if feedback == "":
-            print("⏭️ Pas de feedback, pas de fine-tuning cette fois.\n")
-            continue
+        min_pos, max_neg, pos_scores, neg_scores = evaluate_score_margin(
+            current_model, question, positive_docs, negative_docs, device
+        )
 
-        elif feedback == "none":
-            # Afficher tous les documents pour un choix manuel
-            print("\n📋 Tous les documents disponibles :")
-            for i, doc in enumerate(documents):
-                print(f"[{i}] {doc}")
+        print(f"📈 Scores positifs : {['%.4f' % s for s in pos_scores]}")
+        print(f"📉 Scores négatifs : {['%.4f' % s for s in neg_scores]}")
+        print(f"✅ min(score_positif) = {min_pos:.4f}")
+        print(f"❌ max(score_négatif) = {max_neg:.4f}")
 
-            confirm = input("\n✅ Indique les indices des bons documents (positifs), ou rien pour ne rien faire : ").strip()
-            if confirm == "":
-                print("⏭️ Aucun document jugé pertinent. Skip.\n")
-                continue
-
-            try:
-                good_indices = list(map(int, confirm.split()))
-            except:
-                print("⚠️ Entrée invalide, recommence.")
-                continue
-
-            positive_docs = [documents[i] for i in good_indices if 0 <= i < len(documents)]
-            negative_docs = [documents[i] for i in range(len(documents)) if i not in good_indices]
-
+        if min_pos > max_neg:
+            print("🎯 Condition atteinte : tous les positifs sont mieux scorés que tous les négatifs.")
+            break
         else:
-            try:
-                good_indices = list(map(int, feedback.strip().split()))
-            except:
-                print("⚠️ Entrée invalide, recommence.")
-                continue
+            print("🔁 Encore des négatifs mieux scorés que des positifs. On continue...")
 
-            positive_docs = [retrieved_docs[i] for i in good_indices if 0 <= i < len(retrieved_docs)]
-            negative_docs = [retrieved_docs[i] for i in range(len(retrieved_docs)) if i not in good_indices]
+    current_model.save("models/esti-rag-ft")
+    return SentenceTransformer("models/esti-rag-ft", device=device)
 
-        print("🔍 Avant fine-tuning :", search_faiss(question))
-        updated_model = fine_tune_model(question, positive_docs, negative_docs)
+# --- Pydantic Models ---
+class QuestionRequest(BaseModel):
+    question: str
+    top_k: int = TOP_K
 
-        if updated_model:
-            model = updated_model
-            doc_embeddings = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
-            index = build_faiss_index(doc_embeddings)
-            save_faiss_index(index,doc_embeddings)
-            print("🔁 Index FAISS mis à jour avec les nouveaux embeddings.")
-            print("🔍 Après fine-tuning :", search_faiss(question))
-        else:
-            print("⚠️ Fine-tuning non appliqué.")
+class FeedbackRequest(BaseModel):
+    question: str
+    positive_docs: List[str]
+    negative_docs: List[str]
 
-        print()
+# --- Endpoints ---
+@app.get("/")
+def root():
+    return {"message": "✅ RAG Webservice is running."}
 
-    print("👋 Fin du programme.")
-except KeyboardInterrupt:
-    print("\n👋 Fin du programme (interruption clavier détectée).")
+@app.post("/ask")
+def ask_question(request: QuestionRequest):
+    try:
+        docs, scores = search_faiss(request.question, request.top_k)
+        return {
+            "question": request.question,
+            "results": [{"doc": doc, "score": score} for doc, score in zip(docs, scores)]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/documents")
+def get_all_documents():
+    return {"documents": documents}
+
+@app.post("/feedback")
+def feedback(request: FeedbackRequest):
+    global model, doc_embeddings, index
+
+    try:
+        # 🔍 Avant fine-tuning : rechercher les résultats initiaux
+        docs_before, scores_before = search_faiss(request.question)
+
+        # 🏋️ Fine-tuning
+        updated_model = fine_tune_until_margin_respected(
+    request.question, request.positive_docs,request.negative_docs,model,BATCH_SIZE,EPOCHS,WARMUP_STEPS,DEVICE,
+    max_iterations=10
+)
+
+        if updated_model is None:
+            raise HTTPException(status_code=400, detail="Aucun exemple de fine-tuning fourni.")
+
+        # 🔄 Mise à jour du modèle et de l'index
+        model = updated_model
+        doc_embeddings = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
+        index = build_faiss_index(doc_embeddings)
+
+        # 🔍 Après fine-tuning : rechercher à nouveau
+        docs_after, scores_after = search_faiss(request.question)
+
+        # 📊 Comparaison
+        comparison = {
+            "before": [{"doc": d, "score": s} for d, s in zip(docs_before, scores_before)],
+            "after": [{"doc": d, "score": s} for d, s in zip(docs_after, scores_after)]
+        }
+        print(comparison)
+
+        return {
+            "message": "✅ Fine-tuning terminé et index mis à jour.",
+            "comparison": comparison
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Lancement du serveur ---
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
