@@ -12,12 +12,12 @@ import uvicorn
 
 # --- Configuration ---
 EMBEDDING_MODEL_NAME = "models/esti-rag-ft"
-
+DEFAULT_EMBEDDING_MODEL_NAME='sentence-transformers/all-MiniLM-L6-v2'
 if os.path.exists(EMBEDDING_MODEL_NAME):
     print(f"📂 Chargement du modèle fine-tuné depuis {EMBEDDING_MODEL_NAME}")
 else:
-    print(f"🌐 Aucun modèle fine-tuné trouvé. Chargement du modèle de base : {EMBEDDING_MODEL_NAME}")
-    EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+    print(f"🌐 Aucun modèle fine-tuné trouvé. Chargement du modèle de base : {DEFAULT_EMBEDDING_MODEL_NAME}")
+    EMBEDDING_MODEL_NAME = DEFAULT_EMBEDDING_MODEL_NAME
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TOP_K = 3
@@ -168,6 +168,31 @@ def fine_tune_until_margin_respected(question, positive_docs, negative_docs,
     current_model.save("models/esti-rag-ft")
     return SentenceTransformer("models/esti-rag-ft", device=device)
 
+def fine_tune_with_multiple_negatives(question, positive_docs, model, batch_size, epochs, warmup_steps, device):
+    # Créer des paires question <-> positive
+    train_examples = [InputExample(texts=[question, doc]) for doc in positive_docs]
+
+    if not train_examples:
+        print("⚠️ Aucun exemple pour fine-tuning.")
+        return None
+
+    train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=batch_size)
+    train_loss = losses.MultipleNegativesRankingLoss(model)
+
+    print(f"🏋️ Fine-tuning avec MultipleNegativesRankingLoss sur {len(train_examples)} exemples...")
+
+    model.train()
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        epochs=epochs,
+        warmup_steps=warmup_steps,
+        show_progress_bar=True
+    )
+    print("✅ Fine-tuning terminé.")
+
+    model.save("models/esti-rag-ft")
+    return SentenceTransformer("models/esti-rag-ft", device=device)
+
 # --- Pydantic Models ---
 class QuestionRequest(BaseModel):
     question: str
@@ -207,9 +232,9 @@ def feedback(request: FeedbackRequest):
         docs_before, scores_before = search_faiss(request.question)
 
         # 🏋️ Fine-tuning
-        updated_model = fine_tune_until_margin_respected(
-    request.question, request.positive_docs,request.negative_docs,model,BATCH_SIZE,EPOCHS,WARMUP_STEPS,DEVICE,
-    max_iterations=10
+        updated_model = fine_tune_with_multiple_negatives(
+    request.question, request.positive_docs,
+    model, BATCH_SIZE, EPOCHS, WARMUP_STEPS, DEVICE
 )
 
         if updated_model is None:
